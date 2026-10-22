@@ -1,0 +1,48 @@
+name: codescaler-image
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - Dockerfile
+      - requirements.txt
+      - server.py
+      - .github/workflows/codescaler-image.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: free runner disk
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" || true
+          df -h /
+
+      - uses: actions/checkout@v4
+
+      - name: login to ghcr
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: build and push
+        run: |
+          set -eu
+          REF="ghcr.io/captivefish/el-codescaler-runpod"
+          TAG="sha-${{ github.sha }}"
+          docker build \
+            --build-arg CODESCALER_REVISION=7af52cb53673f05a416a8424b99422f9466eded4 \
+            --label org.opencontainers.image.source=https://github.com/CaptiveFish/el-codescaler-runpod \
+            --label org.opencontainers.image.revision=${{ github.sha }} \
+            --label org.opencontainers.image.base.name=pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime \
+            -t "$REF:$TAG" \
+            -t "$REF:latest" .
+          docker push "$REF:$TAG"
+          docker push "$REF:latest"
+          docker image inspect --format '{{.Id}} {{.Size}}' "$REF:$TAG"
+          df -h /
