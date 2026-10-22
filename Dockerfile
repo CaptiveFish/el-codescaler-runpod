@@ -17,4 +17,4 @@ ENV HF_HUB_OFFLINE=1
 
 COPY server.py .
 EXPOSE 8000
-CMD ["python", "server.py"]
+CMD ["sh", "-c", "exec python -m uvicorn server:app --host 0.0.0.0 --port ${PORT:-8000}"]
