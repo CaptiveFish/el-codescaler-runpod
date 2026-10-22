@@ -6,13 +6,14 @@ Serves exactly the contract consumed by crates/el-core/src/adapters/selector/mod
                [{"candidate_id","generation_index","content"}], "model"?}
   -> 200 {"scores":{candidate_id: float in [0,1]}, "ranking":[ids best first],
           "raw_scores":{candidate_id: logit}, "model", "version", "latency_ms"}
-  GET  /ping   -> 200 when the model is loaded, 204 while initialising (Runpod LB rule)
+  GET  /ping   -> 200 {"status":"healthy",...} when the model is loaded, 204 while it is
+                  still loading, 503 if loading failed (Runpod LB rule)
 
 Scores are sigmoid(raw reward logit): the Bradley-Terry probability scale of the
 reward model. Ranking order is score descending, then smallest generation_index.
 Authentication is enforced by the Runpod edge (Bearer RUNPOD_API_KEY); this process
-never sees or logs credentials. Standard library only, so it runs on a stock
-PyTorch image; torch/transformers are imported lazily by the real scorer.
+never sees or logs credentials. Served by FastAPI/uvicorn; the model loads in a background
+thread so /ping answers at once. torch/transformers are imported lazily by the real scorer.
 """
 
 from __future__ import annotations
@@ -22,8 +23,13 @@ import math
 import os
 import threading
 import time
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from contextlib import asynccontextmanager
 from typing import Callable, Sequence
+
+import uvicorn
+from fastapi import FastAPI, Request, Response
+from fastapi.concurrency import run_in_threadpool
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 MODEL_ID = os.environ.get("CODESCALER_MODEL", "LARK-Lab/CodeScaler-4B")
 MAX_LENGTH = int(os.environ.get("CODESCALER_MAX_LENGTH", "4096"))
@@ -153,67 +159,90 @@ class State:
         self.version = "unloaded"
         self.load_error: str | None = None
 
+def load_model(state: State, factory: Callable[[], object] | None = None) -> None:
+    """Load the scorer into ``state``; never raises (a failure is recorded for /ping)."""
+    try:
+        scorer = (factory or TransformersScorer)()
+        state.version, state.scorer = scorer.version, scorer
+        print(f"loaded {MODEL_ID} version={state.version} device={scorer.device}", flush=True)
+    except Exception as e:
+        state.load_error = f"{type(e).__name__}: {e}"
+        print(f"model load failed: {state.load_error}", flush=True)
 
-def make_handler(state: State, model: str = MODEL_ID):
-    class Handler(BaseHTTPRequestHandler):
-        def _send(self, code: int, payload: dict | None = None):
-            body = b"" if payload is None else json.dumps(payload).encode()
-            self.send_response(code)
-            if payload is not None:
-                self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
+def _json(code: int, payload: dict | None = None) -> Response:
+    # json.dumps default separators keep response bytes identical to the previous
+    # stdlib server (Starlette's JSONResponse would compact them).
+    if payload is None:
+        return Response(status_code=code)
+    return Response(content=json.dumps(payload).encode(), status_code=code, media_type="application/json")
 
-        def do_GET(self):
-            if self.path.split("?")[0] != "/ping":
-                return self._send(404, {"error": "not found"})
-            if state.load_error:
-                return self._send(503, {"status": "unhealthy", "error": state.load_error})
-            if state.scorer is None:
-                return self._send(204)
-            return self._send(200, {"status": "healthy", "model": model, "version": state.version})
+def create_app(
+    state: State | None = None,
+    model: str = MODEL_ID,
+    loader: Callable[[State], None] = load_model,
+    start_loader: bool = True,
+) -> FastAPI:
+    state = state if state is not None else State()
 
-        def do_POST(self):
-            if self.path.split("?")[0] != "/score":
-                return self._send(404, {"error": "not found"})
-            if state.scorer is None:
-                return self._send(503, {"error": "model not loaded"})
-            length = int(self.headers.get("Content-Length") or 0)
-            if length <= 0 or length > RUNPOD_LB_MAX_PAYLOAD_BYTES:
-                return self._send(400, {"error": "missing or oversized body"})
-            try:
-                body = json.loads(self.rfile.read(length))
-                return self._send(200, score_request(body, state.scorer, model, state.version))
-            except (RequestError, json.JSONDecodeError) as e:
-                return self._send(400, {"error": str(e)})
-            except Exception as e:
-                return self._send(500, {"error": f"{type(e).__name__}: {e}"})
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        if start_loader:
+            thread = threading.Thread(target=loader, args=(state,), daemon=True)
+            app.state.loader_thread = thread
+            thread.start()
+        yield
 
-        def log_message(self, fmt, *args):
-            print(f"{self.address_string()} {fmt % args}", flush=True)
+    app = FastAPI(
+        lifespan=lifespan,
+        docs_url=None,
+        redoc_url=None,
+        openapi_url=None,
+        redirect_slashes=False,
+    )
+    app.state.model_state = state
 
-    return Handler
+    @app.exception_handler(StarletteHTTPException)
+    async def http_error(request: Request, exc: StarletteHTTPException) -> Response:
+        # Unknown path or wrong method on a known path: the old server answered 404 for both.
+        if exc.status_code in (404, 405):
+            return _json(404, {"error": "not found"})
+        return _json(exc.status_code, {"error": str(exc.detail)})
 
+    @app.get("/ping")
+    async def ping() -> Response:
+        if state.load_error:
+            return _json(503, {"status": "unhealthy", "error": state.load_error})
+        if state.scorer is None:
+            return _json(204)
+        return _json(200, {"status": "healthy", "model": model, "version": state.version})
+
+    @app.post("/score")
+    async def score(request: Request) -> Response:
+        if state.scorer is None:
+            return _json(503, {"error": "model not loaded"})
+        try:
+            length = int(request.headers.get("content-length") or 0)
+        except ValueError:
+            length = 0
+        if length <= 0 or length > RUNPOD_LB_MAX_PAYLOAD_BYTES:
+            return _json(400, {"error": "missing or oversized body"})
+        try:
+            body = json.loads(await request.body())
+            result = await run_in_threadpool(score_request, body, state.scorer, model, state.version)
+            return _json(200, result)
+        except (RequestError, json.JSONDecodeError) as e:
+            return _json(400, {"error": str(e)})
+        except Exception as e:
+            return _json(500, {"error": f"{type(e).__name__}: {e}"})
+
+    return app
+
+app = create_app()
 
 def main():
-    state = State()
-    port = int(os.environ.get("PORT", "80"))
-    server = ThreadingHTTPServer(("0.0.0.0", port), make_handler(state))
-
-    def load():
-        try:
-            scorer = TransformersScorer()
-            state.version, state.scorer = scorer.version, scorer
-            print(f"loaded {MODEL_ID} version={state.version} device={scorer.device}", flush=True)
-        except Exception as e:
-            state.load_error = f"{type(e).__name__}: {e}"
-            print(f"model load failed: {state.load_error}", flush=True)
-
-    threading.Thread(target=load, daemon=True).start()
+    port = int(os.environ.get("PORT", "8000"))
     print(f"listening on :{port}", flush=True)
-    server.serve_forever()
-
+    uvicorn.run(app, host="0.0.0.0", port=port)
 
 if __name__ == "__main__":
     main()
